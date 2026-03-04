@@ -8,6 +8,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sacrebleu import corpus_bleu
 import math
+from functools import partial
 
 # -------------------- 参数配置 --------------------
 parser = argparse.ArgumentParser()
@@ -43,14 +44,7 @@ parser.add_argument('--seed', type=int, default=42,
                     help='随机种子')
 args = parser.parse_args()
 
-# 创建输出目录
-os.makedirs(args.output_dir, exist_ok=True)
-
-# 固定随机种子
-random.seed(args.seed)
-torch.manual_seed(args.seed)
-
-# -------------------- 步骤1：收集所有平行句对（使用 source.txt 和 target.txt）--------------------
+# -------------------- 函数定义 --------------------
 def collect_sentence_pairs(data_dir):
     """递归遍历所有子目录，从每个 source.txt 和 target.txt 中读取句对"""
     pairs = []
@@ -71,54 +65,53 @@ def collect_sentence_pairs(data_dir):
     print(f"收集到 {len(pairs)} 个句对")
     return pairs
 
-all_pairs = collect_sentence_pairs(args.data_dir)
-
-# 划分训练/验证/测试集
-random.shuffle(all_pairs)
-train_pairs = all_pairs[:int(0.9*len(all_pairs))]
-val_pairs = all_pairs[int(0.9*len(all_pairs)):int(0.95*len(all_pairs))]
-test_pairs = all_pairs[int(0.95*len(all_pairs)):]
-print(f"训练集: {len(train_pairs)}, 验证集: {len(val_pairs)}, 测试集: {len(test_pairs)}")
-
-# 保存为临时文件，用于训练 SentencePiece
 def write_temp_files(pairs, src_file, tgt_file):
+    """将句对写入临时文件（每行一句）"""
     with open(src_file, "w", encoding="utf-8") as f_src, \
          open(tgt_file, "w", encoding="utf-8") as f_tgt:
         for src, tgt in pairs:
             f_src.write(src + "\n")
             f_tgt.write(tgt + "\n")
 
-temp_src = os.path.join(args.output_dir, "train.src")
-temp_tgt = os.path.join(args.output_dir, "train.tgt")
-write_temp_files(train_pairs, temp_src, temp_tgt)
+def build_or_load_tokenizer(train_pairs, output_dir, vocab_size):
+    """
+    如果词表已存在则直接加载，否则训练 SentencePiece 模型并保存。
+    返回 SentencePieceProcessor 实例及相关特殊标记 ID。
+    """
+    model_path = os.path.join(output_dir, "spm_model.model")
+    if os.path.exists(model_path):
+        print(f"加载已存在的词表: {model_path}")
+        sp = spm.SentencePieceProcessor()
+        sp.load(model_path)
+        return sp, sp.pad_id(), sp.bos_id(), sp.eos_id()
 
-# -------------------- 步骤2：训练 SentencePiece 模型 --------------------
-spm_model_prefix = os.path.join(args.output_dir, "spm_model")
-# 合并源和目标语料一起训练
-os.system(f"cat {temp_src} {temp_tgt} > {args.output_dir}/train.all")
+    print("未找到词表，开始训练 SentencePiece 模型...")
+    # 准备训练数据：合并源和目标到单个文件
+    temp_src = os.path.join(output_dir, "train.src")
+    temp_tgt = os.path.join(output_dir, "train.tgt")
+    write_temp_files(train_pairs, temp_src, temp_tgt)
 
-spm.SentencePieceTrainer.train(
-    input=os.path.join(args.output_dir, "train.all"),
-    model_prefix=spm_model_prefix,
-    vocab_size=args.vocab_size,
-    character_coverage=1.0,  # 覆盖所有字符（中文需要）
-    model_type="bpe",
-    pad_id=0, unk_id=1, bos_id=2, eos_id=3,
-    pad_piece="[PAD]", unk_piece="[UNK]", bos_piece="[BOS]", eos_piece="[EOS]"
-)
+    train_all_path = os.path.join(output_dir, "train.all")
+    with open(train_all_path, "w", encoding="utf-8") as out_f:
+        for file_path in [temp_src, temp_tgt]:
+            with open(file_path, "r", encoding="utf-8") as in_f:
+                out_f.write(in_f.read())
 
-# 加载词表
-sp = spm.SentencePieceProcessor()
-sp.load(f"{spm_model_prefix}.model")
+    spm.SentencePieceTrainer.train(
+        input=train_all_path,
+        model_prefix=os.path.join(output_dir, "spm_model"),
+        vocab_size=vocab_size,
+        character_coverage=1.0,          # 覆盖所有字符（中文需要）
+        model_type="bpe",                 # 使用 BPE 算法
+        pad_id=0, unk_id=1, bos_id=2, eos_id=3,
+        pad_piece="[PAD]", unk_piece="[UNK]", bos_piece="[BOS]", eos_piece="[EOS]"
+    )
 
-vocab_size = sp.get_piece_size()
-pad_id = sp.pad_id()
-unk_id = sp.unk_id()
-bos_id = sp.bos_id()
-eos_id = sp.eos_id()
-print(f"词表大小: {vocab_size}")
+    sp = spm.SentencePieceProcessor()
+    sp.load(model_path)
+    print(f"词表训练完成，大小: {sp.get_piece_size()}")
+    return sp, sp.pad_id(), sp.bos_id(), sp.eos_id()
 
-# -------------------- 步骤3：定义数据集类 --------------------
 class TranslationDataset(Dataset):
     def __init__(self, pairs, sp, max_len):
         self.pairs = pairs
@@ -130,21 +123,19 @@ class TranslationDataset(Dataset):
 
     def __getitem__(self, idx):
         src, tgt = self.pairs[idx]
-        # 编码并截断
+        # 编码并截断（预留 [BOS] 和 [EOS] 的位置）
         src_ids = self.sp.encode(src)[:self.max_len-2]
         tgt_ids = self.sp.encode(tgt)[:self.max_len-2]
         # 添加特殊标记
-        src_ids = [bos_id] + src_ids + [eos_id]
-        tgt_ids = [bos_id] + tgt_ids + [eos_id]
+        src_ids = [self.sp.bos_id()] + src_ids + [self.sp.eos_id()]
+        tgt_ids = [self.sp.bos_id()] + tgt_ids + [self.sp.eos_id()]
         return torch.tensor(src_ids), torch.tensor(tgt_ids)
 
-def collate_fn(batch):
-    """动态 padding 并生成掩码"""
+def collate_fn(batch, pad_id):
+    """自定义 batch 处理函数：动态 padding 并生成掩码"""
     src_batch, tgt_batch = zip(*batch)
-    src_lens = [len(seq) for seq in src_batch]
-    tgt_lens = [len(seq) for seq in tgt_batch]
-    max_src_len = max(src_lens)
-    max_tgt_len = max(tgt_lens)
+    max_src_len = max(len(seq) for seq in src_batch)
+    max_tgt_len = max(len(seq) for seq in tgt_batch)
 
     padded_src = torch.zeros(len(batch), max_src_len, dtype=torch.long)
     padded_tgt = torch.zeros(len(batch), max_tgt_len, dtype=torch.long)
@@ -153,24 +144,10 @@ def collate_fn(batch):
     for i, seq in enumerate(tgt_batch):
         padded_tgt[i, :len(seq)] = seq
 
-    src_pad_mask = (padded_src == pad_id)  # (batch, src_len)
-    tgt_pad_mask = (padded_tgt == pad_id)  # (batch, tgt_len)
-
+    src_pad_mask = (padded_src == pad_id)
+    tgt_pad_mask = (padded_tgt == pad_id)
     return padded_src, padded_tgt, src_pad_mask, tgt_pad_mask
 
-# 创建 DataLoader
-train_dataset = TranslationDataset(train_pairs, sp, args.max_len)
-val_dataset = TranslationDataset(val_pairs, sp, args.max_len)
-test_dataset = TranslationDataset(test_pairs, sp, args.max_len)
-
-train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                          collate_fn=collate_fn, num_workers=4, pin_memory=True)
-val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
-                        collate_fn=collate_fn, num_workers=4, pin_memory=True)
-test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False,
-                         collate_fn=collate_fn, num_workers=4, pin_memory=True)
-
-# -------------------- 步骤4：定义 Transformer 模型 --------------------
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=5000):
         super().__init__()
@@ -180,7 +157,7 @@ class PositionalEncoding(nn.Module):
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        pe = pe.unsqueeze(0)
         self.register_buffer('pe', pe)
 
     def forward(self, x):
@@ -208,7 +185,6 @@ class TransformerModel(nn.Module):
                 src_pad_mask=None, tgt_pad_mask=None):
         src_emb = self.pos_encoder(self.embedding(src))
         tgt_emb = self.pos_encoder(self.embedding(tgt))
-
         output = self.transformer(
             src_emb, tgt_emb,
             src_mask=src_mask, tgt_mask=tgt_mask,
@@ -222,23 +198,7 @@ def generate_square_subsequent_mask(sz):
     """生成因果掩码（上三角矩阵）"""
     return torch.triu(torch.ones(sz, sz) * float('-inf'), diagonal=1)
 
-# 初始化模型
-model = TransformerModel(
-    vocab_size=vocab_size,
-    d_model=args.d_model,
-    nhead=args.nhead,
-    num_encoder_layers=args.num_encoder_layers,
-    num_decoder_layers=args.num_decoder_layers,
-    dim_feedforward=args.dim_feedforward,
-    dropout=args.dropout
-).to(args.device)
-
-criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
-optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
-
-# -------------------- 步骤5：训练函数 --------------------
-def train_epoch(model, loader, optimizer, criterion, device):
+def train_epoch(model, loader, optimizer, criterion, device, pad_id, vocab_size):
     model.train()
     total_loss = 0
     for src, tgt, src_pad_mask, tgt_pad_mask in tqdm(loader, desc="Training"):
@@ -267,7 +227,7 @@ def train_epoch(model, loader, optimizer, criterion, device):
         total_loss += loss.item()
     return total_loss / len(loader)
 
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, pad_id, vocab_size):
     model.eval()
     total_loss = 0
     with torch.no_grad():
@@ -292,22 +252,7 @@ def evaluate(model, loader, criterion, device):
             total_loss += loss.item()
     return total_loss / len(loader)
 
-print("开始训练...")
-best_val_loss = float('inf')
-for epoch in range(1, args.epochs + 1):
-    train_loss = train_epoch(model, train_loader, optimizer, criterion, args.device)
-    val_loss = evaluate(model, val_loader, criterion, args.device)
-    scheduler.step(val_loss)
-
-    print(f"Epoch {epoch:2d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-
-    if val_loss < best_val_loss:
-        best_val_loss = val_loss
-        torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pt"))
-        print(f"  -> 保存最佳模型 (val_loss={val_loss:.4f})")
-
-# -------------------- 步骤6：推理函数（贪心解码） --------------------
-def translate_sentence(model, sentence, sp, max_len=50, device='cpu'):
+def translate_sentence(model, sentence, sp, max_len, device, pad_id, bos_id, eos_id):
     model.eval()
     src_ids = sp.encode(sentence)
     src_ids = [bos_id] + src_ids[:max_len-2] + [eos_id]
@@ -346,24 +291,92 @@ def translate_sentence(model, sentence, sp, max_len=50, device='cpu'):
     translation = sp.decode(tgt_ids[1:])
     return translation
 
-# -------------------- 步骤7：测试集 BLEU 评估 --------------------
-def compute_bleu(model, test_pairs, sp, device):
+def compute_bleu(model, test_pairs, sp, max_len, device, pad_id, bos_id, eos_id):
     hypotheses = []
     references = []
     for src, ref in tqdm(test_pairs, desc="Translating test set"):
-        hyp = translate_sentence(model, src, sp, max_len=args.max_len, device=device)
+        hyp = translate_sentence(model, src, sp, max_len, device, pad_id, bos_id, eos_id)
         hypotheses.append(hyp)
         references.append([ref])
     bleu = corpus_bleu(hypotheses, references)
     return bleu.score
 
-# 加载最佳模型
-model.load_state_dict(torch.load(os.path.join(args.output_dir, "best_model.pt")))
-bleu_score = compute_bleu(model, test_pairs, sp, args.device)
-print(f"测试集 BLEU: {bleu_score:.2f}")
+# -------------------- 主程序入口 --------------------
+if __name__ == '__main__':
+    # 创建输出目录
+    os.makedirs(args.output_dir, exist_ok=True)
 
-# 示例翻译
-print("\n示例翻译：")
-sample_src = "学而时习之，不亦说乎？"
-print(f"原文: {sample_src}")
-print(f"译文: {translate_sentence(model, sample_src, sp, device=args.device)}")
+    # 固定随机种子
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    # 步骤1：收集所有平行句对
+    all_pairs = collect_sentence_pairs(args.data_dir)
+
+    # 划分数据集
+    random.shuffle(all_pairs)
+    train_pairs = all_pairs[:int(0.9*len(all_pairs))]
+    val_pairs = all_pairs[int(0.9*len(all_pairs)):int(0.95*len(all_pairs))]
+    test_pairs = all_pairs[int(0.95*len(all_pairs)):]
+    print(f"训练集: {len(train_pairs)}, 验证集: {len(val_pairs)}, 测试集: {len(test_pairs)}")
+
+    # 步骤2：构建或加载词表
+    sp, pad_id, bos_id, eos_id = build_or_load_tokenizer(train_pairs, args.output_dir, args.vocab_size)
+    vocab_size = sp.get_piece_size()
+    print(f"词表大小: {vocab_size}")
+
+    # 步骤3：创建数据集和 DataLoader
+    train_dataset = TranslationDataset(train_pairs, sp, args.max_len)
+    val_dataset = TranslationDataset(val_pairs, sp, args.max_len)
+    test_dataset = TranslationDataset(test_pairs, sp, args.max_len)
+
+    # 创建可 pickle 的 collate_fn
+    collate_fn_with_pad = partial(collate_fn, pad_id=pad_id)
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                              collate_fn=collate_fn_with_pad, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                            collate_fn=collate_fn_with_pad, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False,
+                             collate_fn=collate_fn_with_pad, num_workers=4, pin_memory=True)
+
+    # 步骤4：初始化模型
+    model = TransformerModel(
+        vocab_size=vocab_size,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_encoder_layers=args.num_encoder_layers,
+        num_decoder_layers=args.num_decoder_layers,
+        dim_feedforward=args.dim_feedforward,
+        dropout=args.dropout
+    ).to(args.device)
+
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+
+    # 步骤5：训练循环
+    print("开始训练...")
+    best_val_loss = float('inf')
+    for epoch in range(1, args.epochs + 1):
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, args.device, pad_id, vocab_size)
+        val_loss = evaluate(model, val_loader, criterion, args.device, pad_id, vocab_size)
+        scheduler.step(val_loss)
+
+        print(f"Epoch {epoch:2d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pt"))
+            print(f"  -> 保存最佳模型 (val_loss={val_loss:.4f})")
+
+    # 步骤6：加载最佳模型并在测试集上计算 BLEU
+    model.load_state_dict(torch.load(os.path.join(args.output_dir, "best_model.pt")))
+    bleu_score = compute_bleu(model, test_pairs, sp, args.max_len, args.device, pad_id, bos_id, eos_id)
+    print(f"测试集 BLEU: {bleu_score:.2f}")
+
+    # 示例翻译
+    print("\n示例翻译：")
+    sample_src = "学而时习之，不亦说乎？"
+    print(f"原文: {sample_src}")
+    print(f"译文: {translate_sentence(model, sample_src, sp, args.max_len, args.device, pad_id, bos_id, eos_id)}")
